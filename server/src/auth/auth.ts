@@ -3,10 +3,11 @@ import { Reflector } from '@nestjs/core';
 import type { Request, Response } from 'express';
 import { config } from '../config';
 import { safeEqual, signToken, verifyToken } from '../common/token';
+import { Public } from './public.decorator';
 
+export { Public } from './public.decorator';
 export const COOKIE = 'gcm_session';
 const TTL_MS = 12 * 60 * 60 * 1000; // 12 h
-export const Public = () => SetMetadata('public', true);
 
 @Injectable()
 export class AuthGuard implements CanActivate {

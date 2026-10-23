@@ -65,27 +65,32 @@ export function ApiTab({ perMinute, onPerMinute }: { perMinute: number; onPerMin
         ) : <p className="text-sm text-slate-500">No keys yet. Create one for each system that sends messages, so each can be revoked on its own.</p>}
       </Card>
 
-      <Card title="Send a message">
+      <Card title="Send a message / Webhook">
         <div className="space-y-4 text-sm">
           <p className="text-slate-600">
-            Pass the phone number and the WhatsApp-formatted message. The <b>number</b> to send from is optional: without it the
-            most recently connected number that may be used automatically sends it{' '}
-            {numbers.data ? def ? <>— right now <b>{def.label}</b> (<Phone value={def.phone} />).</> : <Badge tone="red">no current active number</Badge> : null}
+            Send a message via HTTP POST. You only need to pass the recipient's mobile number and message.
+            The sender number is <b>automatically picked from any available connected WhatsApp number</b> using smart load balancing
+            (prioritizing numbers with the highest remaining daily quota) unless you explicitly specify a sender number.
+            {numbers.data ? def ? <> Recommended sender right now: <b>{def.label}</b> (<Phone value={def.phone} />).</> : <Badge tone="red">no current active number</Badge> : null}
           </p>
           <Code>{`curl -X POST ${base}/messages \\
-  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Authorization: Bearer autosend_YOUR_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
     "phone": "9876543210",
     "message": "Dear Parent,\\n*School will remain closed tomorrow* due to heavy rain.\\n_— GCM Convent School_"
   }'`}</Code>
+          <p className="text-xs text-slate-500">
+            Webhook endpoints <code>POST ${base}/webhook</code> and <code>POST ${base}/webhook/send</code> are also supported.
+            You can authenticate with <code>Authorization: Bearer &lt;key&gt;</code>, <code>x-api-key: &lt;key&gt;</code>, or query parameter <code>?token=&lt;key&gt;</code>.
+          </p>
           <table className="table">
             <thead><tr><th className="w-28">Field</th><th>Meaning</th></tr></thead>
             <tbody>
-              <tr><td className="font-mono text-xs">phone</td><td>Required. Indian mobile in any format (98765 43210, +91…, 0…). Other countries with their code.</td></tr>
-              <tr><td className="font-mono text-xs">message</td><td>Required, up to 4096 characters. WhatsApp formatting: <code>*bold*</code> <code>_italic_</code> <code>~strike~</code> <code>```mono```</code>, new lines with <code>\n</code>.</td></tr>
-              <tr><td className="font-mono text-xs">number</td><td>Optional. Number id, session name or phone of the sending number (see <code>GET /api/v1/numbers</code>).</td></tr>
-              <tr><td className="font-mono text-xs">ref</td><td>Optional. Your own id for the message — sending the same ref again returns the first message instead of a duplicate.</td></tr>
+              <tr><td className="font-mono text-xs">phone / mobile</td><td>Required. Recipient mobile in any format (98765 43210, +91…, 0…). Other countries with country code.</td></tr>
+              <tr><td className="font-mono text-xs">message / text</td><td>Required, up to 4096 characters. WhatsApp formatting: <code>*bold*</code> <code>_italic_</code> <code>~strike~</code> <code>```mono```</code>, new lines with <code>\n</code>.</td></tr>
+              <tr><td className="font-mono text-xs">number / from</td><td>Optional. If omitted, smart load balancing chooses the best available active number under daily cap.</td></tr>
+              <tr><td className="font-mono text-xs">ref</td><td>Optional. Idempotency reference for your message to prevent duplicate sends on retries.</td></tr>
             </tbody>
           </table>
           <p className="text-slate-600">Answer (<b>202</b>): the message is queued and goes out within seconds, with the number's safe pacing. Check it with <code>GET /api/v1/messages/&lt;id&gt;</code>:</p>

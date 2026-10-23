@@ -1,10 +1,11 @@
 import {
   BadRequestException, Body, ConflictException, Controller, Delete, Get, Headers, HttpCode, HttpException, Injectable,
-  NotFoundException, Param, ParseIntPipe, Post, ServiceUnavailableException, UnauthorizedException, UnprocessableEntityException,
+  NotFoundException, Param, ParseIntPipe, Post, Query, Req, ServiceUnavailableException, UnauthorizedException, UnprocessableEntityException,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import { createHash, randomBytes } from 'crypto';
 import { Db } from '../db/db.service';
-import { Public } from '../auth/auth';
+import { Public } from '../auth/public.decorator';
 import { SettingsService } from '../settings/settings.service';
 import { NumberRow } from '../numbers/numbers.service';
 import { effectiveCap } from '../numbers/warmup';
@@ -32,10 +33,10 @@ export class ApiService {
   async createKey(name: string) {
     const n = String(name ?? '').trim().slice(0, 60);
     if (!n) throw new BadRequestException('Give the key a name, e.g. "School ERP"');
-    const key = `gcm_${randomBytes(24).toString('base64url')}`;
+    const key = `autosend_${randomBytes(24).toString('base64url')}`;
     const row = await this.db.one<KeyRow>(
       'insert into api_keys(name, prefix, key_hash) values ($1,$2,$3) returning id, name, prefix, created_at, last_used_at, revoked_at',
-      [n, key.slice(0, 10), hash(key)]);
+      [n, key.slice(0, 17), hash(key)]);
     await this.db.event('api', `API key "${n}" created`);
     return { ...row!, key }; // the only time the full key is returned
   }
@@ -55,11 +56,18 @@ export class ApiService {
   }
 
   // ---------- public side ----------
-  async authenticate(authorization?: string, xApiKey?: string): Promise<KeyRow> {
-    const key = (xApiKey || authorization?.replace(/^Bearer\s+/i, '') || '').trim();
-    if (!key) throw new UnauthorizedException({ error: 'missing_api_key', message: 'Send your key as "Authorization: Bearer <key>"' });
+  async authenticate(authorization?: string, xApiKey?: string, queryToken?: string): Promise<KeyRow> {
+    const key = (queryToken || xApiKey || authorization?.replace(/^Bearer\s+/i, '') || '').trim();
+    if (!key) {
+      throw new UnauthorizedException({
+        error: 'missing_api_key',
+        message: 'Send your key as "Authorization: Bearer <key>", "x-api-key" header, or "?token=<key>" query parameter',
+      });
+    }
     const k = await this.db.one<KeyRow>('select * from api_keys where key_hash=$1', [hash(key)]);
-    if (!k || k.revoked_at) throw new UnauthorizedException({ error: 'invalid_api_key', message: 'This API key is not valid (or was revoked)' });
+    if (!k || k.revoked_at) {
+      throw new UnauthorizedException({ error: 'invalid_api_key', message: 'This API key is not valid (or was revoked)' });
+    }
     // Rate limit per key (sliding minute)
     const limit = (await this.settings.get()).api.perMinute;
     const now = Date.now();
@@ -72,12 +80,16 @@ export class ApiService {
   }
 
   /**
-   * Which number sends: the one asked for (id, session name or its phone number), else the most recently
-   * connected number that is allowed to be used automatically.
+   * Which number sends:
+   * - If a specific sender is requested (id, session name, or phone): validates and uses it.
+   * - Otherwise, applies Smart Load Balancing across any available number:
+   *   Filters for WORKING, unpaused, auto-use numbers.
+   *   Picks the number with the most remaining daily quota (effectiveCap - sent_today),
+   *   cycling messages evenly across all connected numbers.
    */
   async pickNumber(sel: unknown): Promise<NumberRow & { auto_use: boolean }> {
     const rows = await this.db.query<NumberRow & { auto_use: boolean }>('select * from wa_numbers order by status_at desc, id desc');
-    if (sel !== undefined && sel !== null && String(sel).trim() !== '') {
+    if (sel !== undefined && sel !== null && String(sel).trim() !== '' && String(sel).trim().toLowerCase() !== 'any' && String(sel).trim().toLowerCase() !== 'auto') {
       const s = String(sel).trim();
       const digits = s.replace(/\D/g, '');
       const n = rows.find((r) => String(r.id) === s || r.session === s || (digits.length >= 10 && !!r.phone && r.phone.endsWith(digits.slice(-10))));
@@ -86,18 +98,46 @@ export class ApiService {
       if (n.paused) throw fail(409, 'number_paused', `Number "${n.label}" is paused${n.pause_reason ? `: ${n.pause_reason}` : ''}`);
       return n;
     }
-    const n = rows.find((r) => r.status === 'WORKING' && !r.paused && r.auto_use);
-    if (!n) throw new ServiceUnavailableException({ error: 'no_active_number', message: 'No current active number' });
-    return n;
+
+    // Smart load balancing across all working, unpaused numbers marked for auto_use
+    const active = rows.filter((r) => r.status === 'WORKING' && !r.paused && r.auto_use);
+    if (!active.length) {
+      throw new ServiceUnavailableException({ error: 'no_active_number', message: 'No current active WhatsApp number available to send messages' });
+    }
+
+    // Compute remaining quota for each active number
+    const scored = active.map((r) => {
+      const cap = effectiveCap(r);
+      const remaining = cap - (r.sent_today ?? 0);
+      return { r, cap, remaining, sentToday: r.sent_today ?? 0 };
+    });
+
+    // Prefer numbers that still have quota left today (remaining > 0),
+    // choosing the one with the highest remaining quota.
+    // In case of a tie, pick the one that has sent fewer messages today.
+    const withQuota = scored.filter((s) => s.remaining > 0);
+    if (withQuota.length > 0) {
+      withQuota.sort((a, b) => b.remaining - a.remaining || a.sentToday - b.sentToday);
+      return withQuota[0].r;
+    }
+
+    // If all numbers reached their daily cap, pick the one with lowest sentToday / highest cap
+    scored.sort((a, b) => a.sentToday - b.sentToday || b.cap - a.cap);
+    return scored[0].r;
   }
 
-  async send(key: KeyRow, b: { phone?: unknown; message?: unknown; number?: unknown; ref?: unknown }) {
-    const text = typeof b?.message === 'string' ? b.message.replace(/\r\n/g, '\n').trim() : '';
-    if (!text) throw fail(400, 'message_required', '"message" is required (WhatsApp formatting like *bold* and _italic_ works)');
+  async send(key: KeyRow, b: { phone?: unknown; mobile?: unknown; to?: unknown; message?: unknown; text?: unknown; body?: unknown; number?: unknown; from?: unknown; ref?: unknown; client_ref?: unknown }) {
+    const rawText = b?.message ?? b?.text ?? b?.body;
+    const text = typeof rawText === 'string' ? rawText.replace(/\r\n/g, '\n').trim() : '';
+    if (!text) throw fail(400, 'message_required', '"message" (or "text") is required (WhatsApp formatting like *bold* and _italic_ works)');
     if (text.length > MAX_TEXT) throw fail(400, 'message_too_long', `"message" can be at most ${MAX_TEXT} characters`);
-    const phone = normalizePhone(b?.phone);
-    if (!phone) throw fail(400, 'invalid_phone', '"phone" must be a valid mobile number, e.g. 9876543210 or +919876543210');
-    const ref = b?.ref === undefined || b?.ref === null || b?.ref === '' ? null : String(b.ref).slice(0, 100);
+
+    const rawPhone = b?.phone ?? b?.mobile ?? b?.to;
+    const phone = normalizePhone(rawPhone);
+    if (!phone) throw fail(400, 'invalid_phone', '"phone" (or "mobile") must be a valid mobile number, e.g. 9876543210 or +919876543210');
+
+    const rawRef = b?.ref ?? b?.client_ref;
+    const ref = rawRef === undefined || rawRef === null || rawRef === '' ? null : String(rawRef).slice(0, 100);
 
     if (ref) {
       const dup = await this.db.one<{ id: number }>('select id from messages where api_key_id=$1 and client_ref=$2', [key.id, ref]);
@@ -109,7 +149,9 @@ export class ApiService {
     const check = await this.db.one<{ on_whatsapp: boolean }>(`select on_whatsapp from phone_checks where phone=$1 and checked_at > now() - interval '30 days'`, [phone]);
     if (check && !check.on_whatsapp) throw new UnprocessableEntityException({ error: 'not_on_whatsapp', message: 'This number is not on WhatsApp' });
 
-    const n = await this.pickNumber(b?.number);
+    // Pick sender number (smart load balancing across any available number if not explicitly specified)
+    const senderSel = b?.from ?? b?.number;
+    const n = await this.pickNumber(senderSel);
     const row = await this.db.one<{ id: number }>(
       `insert into messages(number_id, fixed_number, chat_id, phone, recipient, body, priority, api_key_id, client_ref)
        values ($1,true,$2,$3,$4,$5,10,$6,$7) on conflict do nothing returning id`,
@@ -137,14 +179,17 @@ export class ApiService {
 
   async activeNumbers() {
     const rows = await this.db.query<NumberRow & { auto_use: boolean }>('select * from wa_numbers order by status_at desc, id desc');
-    const auto = rows.find((r) => r.status === 'WORKING' && !r.paused && r.auto_use);
+    const active = rows.filter((r) => r.status === 'WORKING' && !r.paused && r.auto_use);
+    const best = active
+      .map((r) => ({ r, remaining: effectiveCap(r) - (r.sent_today ?? 0) }))
+      .sort((a, b) => b.remaining - a.remaining)[0]?.r;
     return rows.filter((r) => r.status === 'WORKING' && !r.paused).map((r) => ({
-      id: r.id, label: r.label, phone: r.phone, session: r.session, default: r.id === auto?.id, remaining_today: Math.max(0, effectiveCap(r) - r.sent_today),
+      id: r.id, label: r.label, phone: r.phone, session: r.session, default: r.id === best?.id, remaining_today: Math.max(0, effectiveCap(r) - r.sent_today),
     }));
   }
 }
 
-/** Public API — authenticated with an API key, not the dashboard login. */
+/** Public API & Webhooks — authenticated with an API key / token. */
 @Controller('v1')
 export class PublicApiController {
   constructor(private readonly api: ApiService) {}
@@ -152,20 +197,69 @@ export class PublicApiController {
   @Public()
   @Post('messages')
   @HttpCode(202)
-  async send(@Headers('authorization') auth: string | undefined, @Headers('x-api-key') x: string | undefined, @Body() b: any) {
-    return this.api.send(await this.api.authenticate(auth, x), b ?? {});
+  async send(
+    @Headers('authorization') auth: string | undefined,
+    @Headers('x-api-key') x: string | undefined,
+    @Query('token') token: string | undefined,
+    @Query('api_key') apiKey: string | undefined,
+    @Req() req: Request,
+    @Body() b: any,
+  ) {
+    const payload = { ...(req.query as Record<string, any>), ...(b ?? {}) };
+    return this.api.send(await this.api.authenticate(auth, x, token || apiKey), payload);
+  }
+
+  @Public()
+  @Post('webhook')
+  @HttpCode(202)
+  async webhook(
+    @Headers('authorization') auth: string | undefined,
+    @Headers('x-api-key') x: string | undefined,
+    @Query('token') token: string | undefined,
+    @Query('api_key') apiKey: string | undefined,
+    @Req() req: Request,
+    @Body() b: any,
+  ) {
+    const payload = { ...(req.query as Record<string, any>), ...(b ?? {}) };
+    return this.api.send(await this.api.authenticate(auth, x, token || apiKey), payload);
+  }
+
+  @Public()
+  @Post('webhook/send')
+  @HttpCode(202)
+  async webhookSend(
+    @Headers('authorization') auth: string | undefined,
+    @Headers('x-api-key') x: string | undefined,
+    @Query('token') token: string | undefined,
+    @Query('api_key') apiKey: string | undefined,
+    @Req() req: Request,
+    @Body() b: any,
+  ) {
+    const payload = { ...(req.query as Record<string, any>), ...(b ?? {}) };
+    return this.api.send(await this.api.authenticate(auth, x, token || apiKey), payload);
   }
 
   @Public()
   @Get('messages/:id')
-  async status(@Headers('authorization') auth: string | undefined, @Headers('x-api-key') x: string | undefined, @Param('id', ParseIntPipe) id: number) {
-    return this.api.status(await this.api.authenticate(auth, x), id);
+  async status(
+    @Headers('authorization') auth: string | undefined,
+    @Headers('x-api-key') x: string | undefined,
+    @Query('token') token: string | undefined,
+    @Query('api_key') apiKey: string | undefined,
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    return this.api.status(await this.api.authenticate(auth, x, token || apiKey), id);
   }
 
   @Public()
   @Get('numbers')
-  async numbers(@Headers('authorization') auth: string | undefined, @Headers('x-api-key') x: string | undefined) {
-    await this.api.authenticate(auth, x);
+  async numbers(
+    @Headers('authorization') auth: string | undefined,
+    @Headers('x-api-key') x: string | undefined,
+    @Query('token') token: string | undefined,
+    @Query('api_key') apiKey: string | undefined,
+  ) {
+    await this.api.authenticate(auth, x, token || apiKey);
     return this.api.activeNumbers();
   }
 }
