@@ -3,6 +3,7 @@ import { Db } from '../db/db.service';
 import type { RecipientMode } from '../campaigns/render';
 import { cleanRule, NumberRule, PRIMARY_RULE } from '../contacts/rules';
 import { checkTemplate } from '../campaigns/render';
+import { DEFAULT_LINES, DEFAULT_RULES, Lines, RankRules } from '../oneclick/marks';
 
 export interface SpeedPreset { delayMinMs: number; delayMaxMs: number; burstMin: number; burstMax: number; burstPauseMinMs: number; burstPauseMaxMs: number }
 
@@ -33,8 +34,32 @@ export interface AppSettings {
   waCheck: { enabled: boolean; everyDays: number; perHour: number };   // background "is this number on WhatsApp?" check
   api: { perMinute: number };          // public send API: messages per key per minute
   oneClick: { marks: { template: string }; fees: { template: string } };
+  marksReport: MarksReportSettings;    // Daily Marks Report + the marks statement used by manual 1-Click marks
   seededTypes: string[];               // default message types already added once (a removed one is not re-added)
 }
+
+/** Daily Marks Report: runs at `time` on `days`, sends every result added since the last successful run. */
+export interface MarksReportSettings {
+  enabled: boolean;
+  time: string;                        // HH:MM, app timezone
+  days: number[];                      // 0 = Sunday
+  skipHolidays: boolean;
+  startFrom: string;                   // Frappe datetime: the first run reads results added after this (set when first switched on)
+  rules: RankRules;
+  lines: Lines;
+  template: string;
+}
+
+export const STATEMENT_TEMPLATE = `Dear Parent,
+
+*{{student_name}}* ({{section}}) — {{period}}:
+
+{{marks}}
+
+*Total: {{total}} / {{max}} ({{percent}}%)*
+{{rank_line}}
+
+— GCM Convent School`;
 
 export const MARKS_TEMPLATE = `Dear Parent,
 
@@ -76,6 +101,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   waCheck: { enabled: true, everyDays: 7, perHour: 200 },
   api: { perMinute: 60 },
   oneClick: { marks: { template: MARKS_TEMPLATE }, fees: { template: FEES_TEMPLATE } },
+  marksReport: { enabled: false, time: '19:00', days: [1, 2, 3, 4, 5, 6], skipHolidays: true, startFrom: '', rules: DEFAULT_RULES, lines: DEFAULT_LINES, template: STATEMENT_TEMPLATE },
   seededTypes: ['notice', 'invitation', 'fees', 'greeting', 'reminder', 'sos', 'academic'],
   messageTypes: [
     { key: 'notice', name: 'Notice', icon: '📢', rule: PRIMARY_RULE, school: 'primary', speed: 'normal', quietHours: true, overrideOptOut: false },
@@ -157,6 +183,7 @@ export class SettingsService {
       try { checkTemplate(t); } catch (e) { throw new BadRequestException(`${k === 'marks' ? 'Marks' : 'Fees'} message: ${(e as Error).message}`); }
       next.oneClick[k] = { template: t || (k === 'marks' ? MARKS_TEMPLATE : FEES_TEMPLATE) };
     }
+    next.marksReport = cleanMarksReport(next.marksReport);
     next.holidays = [...new Set((next.holidays ?? []).map((d) => String(d).trim()).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)))].sort();
     await this.db.query(
       `insert into settings(key, value, updated_at) values ('app', $1, now())
@@ -166,6 +193,29 @@ export class SettingsService {
     this.cache = next;
     return next;
   }
+}
+
+const clamp = (v: unknown, lo: number, hi: number, d: number) => Math.max(lo, Math.min(hi, Math.round(Number(v) || d)));
+
+export function cleanMarksReport(m: any): MarksReportSettings {
+  const time = /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(m?.time)) ? String(m.time).padStart(5, '0') : '19:00';
+  const days = [...new Set((Array.isArray(m?.days) ? m.days : []).map(Number).filter((d: number) => d >= 0 && d <= 6))].sort() as number[];
+  if (m?.enabled && !days.length) throw new BadRequestException('Daily Marks Report: pick at least one day');
+  const template = String(m?.template ?? '').trim() || STATEMENT_TEMPLATE;
+  const lines = { rankLine: String(m?.lines?.rankLine ?? '').trim() || DEFAULT_LINES.rankLine, bottomLine: String(m?.lines?.bottomLine ?? '').trim() || DEFAULT_LINES.bottomLine };
+  for (const [what, t] of [['message', template], ['rank line', lines.rankLine], ['note', lines.bottomLine]]) {
+    try { checkTemplate(t); } catch (e) { throw new BadRequestException(`Daily Marks Report ${what}: ${(e as Error).message}`); }
+  }
+  return {
+    enabled: !!m?.enabled, time, days, skipHolidays: m?.skipHolidays !== false,
+    startFrom: /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(String(m?.startFrom)) ? String(m.startFrom).slice(0, 19) : '',
+    rules: {
+      minRanked: clamp(m?.rules?.minRanked, 2, 100, DEFAULT_RULES.minRanked),
+      minEnteredPct: clamp(m?.rules?.minEnteredPct, 0, 100, DEFAULT_RULES.minEnteredPct),
+      topPct: clamp(m?.rules?.topPct, 1, 100, DEFAULT_RULES.topPct),
+    },
+    lines, template,
+  };
 }
 
 function deepMerge(base: any, patch: any): any {

@@ -6,6 +6,7 @@ import { Phone, RevealAll, WaMark } from '../components/phone';
 import { SCHOOL_LABEL } from '../components/rules';
 import { ListPicker } from './CampaignEditor';
 import type { GroupNode } from './Contacts';
+import { DailyMarksReport, MarksPick, MarksPicker } from './MarksReport';
 
 type Kind = 'marks' | 'fees';
 interface Row {
@@ -15,14 +16,14 @@ interface Row {
   lastSent: { at: string; summary: string } | null; selected: boolean;
 }
 interface Fetched {
-  fetchId: string; kind: Kind; label: string; fetchedAt: string; rows: Row[]; notInApp: number; total: string | null;
+  fetchId: string; kind: Kind; label: string; fetchedAt: string; rows: Row[]; notInApp: number; total: string | null; alreadySent: number;
   type: { key: string; name: string; icon: string; school: keyof typeof SCHOOL_LABEL }; template: string;
 }
 
 const KINDS: Record<Kind, { icon: string; title: string; text: string; vars: [string, string][] }> = {
   marks: {
-    icon: '📝', title: 'Assessment marks', text: "Each parent gets their child's subject-wise marks for an exam, straight from Frappe.",
-    vars: [['marks', 'Subject list'], ['total', 'Total'], ['max', 'Out of'], ['percent', '%'], ['exam', 'Exam'], ['student_name', 'Student'], ['class', 'Class'], ['section', 'Section'], ['parent_name', 'Parent']],
+    icon: '📝', title: 'Assessment marks', text: 'Pick classes, dates and tests — both parents get one statement per child with the class rank when it is fair.',
+    vars: [['marks', 'Test list'], ['total', 'Total'], ['max', 'Out of'], ['percent', '%'], ['rank_line', 'Rank / note'], ['period', 'Period'], ['student_name', 'Student'], ['class', 'Class'], ['section', 'Section'], ['parent_name', 'Parent']],
   },
   fees: {
     icon: '💰', title: 'Pending fees', text: "Each parent gets what's still outstanding for their child, straight from Frappe.",
@@ -49,6 +50,7 @@ function Home({ onPick }: { onPick: (k: Kind) => void }) {
   const { data: history } = useLoad(() => api.get<any[]>('/oneclick/history'), []);
   return (
     <div className="space-y-6">
+      <DailyMarksReport />
       <div className="grid gap-4 md:grid-cols-2">
         {(Object.keys(KINDS) as Kind[]).map((k) => (
           <button key={k} onClick={() => onPick(k)} className="card group p-5 text-left transition hover:border-brand-600 hover:shadow-md">
@@ -94,9 +96,9 @@ function Flow({ kind }: { kind: Kind }) {
   const nav = useNavigate();
   const K = KINDS[kind];
   const { data: tree } = useLoad(() => api.get<GroupNode[]>('/groups'), []);
-  const exams = useLoad(() => (kind === 'marks' ? api.get<any[]>('/oneclick/exams') : Promise.resolve([])), [kind]);
+  const { data: report } = useLoad(() => (kind === 'marks' ? api.get<any>('/oneclick/marks-report') : Promise.resolve(null)), [kind]);
   const { data: numbers } = useLoad(() => api.get<any[]>('/numbers'), []);
-  const [exam, setExam] = useState('');
+  const [pick, setPick] = useState<MarksPick | null>(null);
   const [groupIds, setGroupIds] = useState<number[]>([]);
   const [dueBy, setDueBy] = useState('');
   const [minAmount, setMinAmount] = useState('');
@@ -115,7 +117,6 @@ function Flow({ kind }: { kind: Kind }) {
   const [sending, setSending] = useState(false);
   const text = useRef<HTMLTextAreaElement>(null);
 
-  useEffect(() => { if (!exam && exams.data?.length) setExam(`${exams.data[0].year}|${exams.data[0].exam}`); }, [exams.data]);
   useEffect(() => {
     if (numbers && !numberIds.length) setNumberIds(numbers.filter((n) => n.status === 'WORKING' && !n.paused && n.auto_use !== false).map((n) => n.id));
   }, [numbers]);
@@ -124,9 +125,8 @@ function Flow({ kind }: { kind: Kind }) {
   const fetchNow = async () => {
     setFetching(true); setFetchError(null);
     try {
-      const [year, ex] = exam.split('|');
       const r = await api.post<Fetched>('/oneclick/fetch', kind === 'marks'
-        ? { kind, year, exam: ex, groupIds }
+        ? { kind, ...pick }
         : { kind, groupIds, dueBy: dueBy || null, minAmount: Number(minAmount) || 0 });
       setData(r);
       setSel(new Set(r.rows.filter((x) => x.selected).map((x) => x.id)));
@@ -177,43 +177,33 @@ function Flow({ kind }: { kind: Kind }) {
     } catch (e) { toast((e as Error).message, 'error'); } finally { setSending(false); }
   };
 
-  const fixHint = (fetchError ?? exams.error ?? '').includes("can't read");
+  const fixHint = (fetchError ?? '').includes("can't read");
   return (
     <div className="space-y-5">
       {/* 1. What */}
       <Card>
         <StepHead n={1} title={`${K.icon} ${K.title} — what to send`} done={!!data} />
-        <div className="grid gap-4 md:grid-cols-3">
-          {kind === 'marks' ? (
-            <Field label="Exam" hint={exams.loading ? 'Loading exams from Frappe…' : undefined}>
-              <select className="input" value={exam} onChange={(e) => setExam(e.target.value)} disabled={!exams.data?.length}>
-                {!exams.data?.length && <option value="">{exams.error ? 'Could not load exams' : 'No exams with results yet'}</option>}
-                {exams.data?.map((e) => (
-                  <option key={`${e.year}|${e.exam}`} value={`${e.year}|${e.exam}`}>
-                    {e.exam}{e.year ? ` · ${e.year}` : ''} — {e.students} students{e.sent ? ` · sent to ${e.sent.n}` : ''}
-                  </option>))}
-              </select>
-            </Field>
-          ) : (
-            <>
-              <Field label="Only fees due by" hint="Empty = everything outstanding"><input className="input" type="date" value={dueBy} onChange={(e) => setDueBy(e.target.value)} /></Field>
-              <Field label="Only if at least (₹)"><input className="input" type="number" min={0} value={minAmount} onChange={(e) => setMinAmount(e.target.value)} placeholder="0" /></Field>
-            </>
-          )}
-          <div className={kind === 'marks' ? 'md:col-span-2' : ''}>
-            <span className="label">Classes (optional)</span>
-            <ListPicker tree={schoolTree} ids={groupIds} onChange={setGroupIds} />
+        {kind === 'marks' ? (
+          <MarksPicker tree={schoolTree} minPct={report?.settings?.rules?.minEnteredPct ?? 70} onChange={setPick} />
+        ) : (
+          <div className="grid gap-4 md:grid-cols-3">
+            <Field label="Only fees due by" hint="Empty = everything outstanding"><input className="input" type="date" value={dueBy} onChange={(e) => setDueBy(e.target.value)} /></Field>
+            <Field label="Only if at least (₹)"><input className="input" type="number" min={0} value={minAmount} onChange={(e) => setMinAmount(e.target.value)} placeholder="0" /></Field>
+            <div>
+              <span className="label">Classes (optional)</span>
+              <ListPicker tree={schoolTree} ids={groupIds} onChange={setGroupIds} />
+            </div>
           </div>
-        </div>
+        )}
         <div className="mt-4 flex flex-wrap items-center gap-3">
-          <button className="btn-primary" disabled={fetching || (kind === 'marks' && !exam)} onClick={fetchNow}>
-            {fetching ? 'Fetching from Frappe…' : data ? '↻ Fetch again' : 'Fetch from Frappe'}
+          <button className="btn-primary" disabled={fetching || (kind === 'marks' && !pick?.plans.length)} onClick={fetchNow}>
+            {fetching ? 'Fetching from Frappe…' : data ? '↻ Fetch again' : kind === 'marks' ? 'Prepare messages' : 'Fetch from Frappe'}
           </button>
-          {data && <span className="text-xs text-slate-500">Fetched {fmtDate(data.fetchedAt)} · {data.rows.length} students{data.total && <> · {data.total} outstanding</>}{data.notInApp > 0 && <> · {data.notInApp} not synced to the app yet</>}</span>}
+          {data && <span className="text-xs text-slate-500">Fetched {fmtDate(data.fetchedAt)} · {data.rows.length} students{data.total && <> · {data.total} outstanding</>}{data.notInApp > 0 && <> · {data.notInApp} not synced to the app yet</>}{data.alreadySent > 0 && <> · {data.alreadySent} results left out (already sent)</>}</span>}
         </div>
-        {(fetchError || exams.error) && (
+        {fetchError && (
           <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-            {fetchError ?? exams.error}
+            {fetchError}
             {fixHint && <p className="mt-1 text-xs text-red-600">This is a one-time permission in Frappe: Role Permission Manager → {kind === 'marks' ? 'Assessment Result' : 'Fees'} → give the API user's role <b>Read</b>.</p>}
           </div>
         )}
@@ -226,7 +216,7 @@ function Flow({ kind }: { kind: Kind }) {
             <StepHead n={2} title="Check who gets it" done={sel.size > 0}>
               <RevealAll />
             </StepHead>
-            {!data.rows.length ? <Empty>Nobody to notify{kind === 'fees' ? ' — no pending fees for these filters' : ' — no results for this exam in the chosen classes'}.</Empty> : (
+            {!data.rows.length ? <Empty>Nobody to notify{kind === 'fees' ? ' — no pending fees for these filters' : ' — everything in these tests was already sent (tick "Include marks already sent" for a full statement)'}.</Empty> : (
               <>
                 <div className="mb-3 flex flex-wrap items-center gap-2">
                   <input className="input w-56 py-1.5" placeholder="Search student, adm. no, class…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -257,7 +247,9 @@ function Flow({ kind }: { kind: Kind }) {
                   </table>
                 </div>
                 <p className="mt-2 text-xs text-slate-500">
-                  Goes to: <b>{SCHOOL_LABEL[data.type.school]}</b> (from the {data.type.icon} {data.type.name} message type — <Link to="/settings?tab=types" className="underline">change</Link>).
+                  Goes to: <b>{SCHOOL_LABEL[data.type.school]}</b>{kind === 'marks'
+                    ? ' (always, for marks — the same number twice gets one message).'
+                    : <> (from the {data.type.icon} {data.type.name} message type — <Link to="/settings?tab=types" className="underline">change</Link>).</>}
                   {counts.sent > 0 && ' Students already notified are not ticked — tick them to send again.'}
                 </p>
               </>

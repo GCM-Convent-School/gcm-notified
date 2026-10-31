@@ -15,14 +15,14 @@ export class AlertsService {
 
   /**
    * Sends an alert by email and WhatsApp (from a connected number other than `excludeNumberId`).
-   * The same `key` is not re-sent within 30 minutes.
+   * The same `key` is not re-sent within 30 minutes. `info` = a routine report rather than a warning.
    */
-  async send(key: string, subject: string, text: string, excludeNumberId?: number) {
+  async send(key: string, subject: string, text: string, excludeNumberId?: number, info = false) {
     const now = Date.now();
     if ((this.lastSent.get(key) ?? 0) > now - 30 * 60_000) return;
     this.lastSent.set(key, now);
 
-    await this.db.event('alert', `${subject} — ${text}`, 'warn');
+    await this.db.event('alert', `${subject} — ${text}`, info ? 'info' : 'warn');
     const s = (await this.settings.get()).alerts;
     const results: string[] = [];
 
@@ -43,14 +43,14 @@ export class AlertsService {
       );
       if (from) {
         try {
-          await this.waha.sendText(from.session, toChatId(admin), `⚠️ *${subject}*\n${text}`);
+          await this.waha.sendText(from.session, toChatId(admin), `${info ? '📊' : '⚠️'} *${subject}*\n${text}`);
           results.push(`whatsapp via ${from.session}`);
         } catch (e) {
           this.log.error(`WhatsApp alert failed: ${(e as Error).message}`);
         }
       }
     }
-    this.log.warn(`ALERT ${subject} → ${results.join(', ') || 'no channel available'}`);
+    this.log[info ? 'log' : 'warn'](`ALERT ${subject} → ${results.join(', ') || 'no channel available'}`);
   }
 
   async test() {
