@@ -48,6 +48,15 @@ export class FrappeSyncService implements OnApplicationBootstrap {
     return ((await res.json()) as { data: T[] }).data;
   }
 
+  /** Frappe's own timezone — `creation` timestamps are stored in it. */
+  async timezone(): Promise<string> {
+    const res = await fetch(`${config.frappeUrl}/api/method/frappe.client.get_time_zone`, {
+      headers: { Authorization: `token ${config.frappeApiKey}:${config.frappeApiSecret}`, Accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(`Frappe timezone → HTTP ${res.status}`);
+    return ((await res.json()) as { message: { time_zone: string } }).message.time_zone;
+  }
+
   async status() {
     const last = await this.db.one('select * from sync_runs order by id desc limit 1');
     return { configured: frappeConfigured(), running: this.running, last };

@@ -1,22 +1,29 @@
 import { BadRequestException, Body, Controller, Get, Injectable, NotFoundException, Post } from '@nestjs/common';
 import { randomBytes } from 'crypto';
 import { Db } from '../db/db.service';
-import { frappeConfigured } from '../config';
-import { FrappeAccessError, FrappeSyncService } from '../contacts/frappe-sync.service';
 import { SettingsService } from '../settings/settings.service';
 import { CampaignsService } from '../campaigns/campaigns.service';
-import { checkTemplate, phonesFor, renderMessage, StudentRow, studentRecipients } from '../campaigns/render';
-import { buildFees, buildMarks, fmtDate, rupees, StudentVars } from './build';
+import { checkTemplate, phonesFor, RecipientMode, renderMessage, StudentRow, studentRecipients } from '../campaigns/render';
+import { buildFees, fmtDate, rupees, StudentVars } from './build';
 import { localDay } from '../campaigns/schedule';
+import { MarksService, Statement, TestFilter } from './marks.service';
 
 type Kind = 'marks' | 'fees';
 const TYPE: Record<Kind, 'academic' | 'fees'> = { marks: 'academic', fees: 'fees' };
 
+// Marks always go to both parents (the same number twice gets one message)
+const MODE: Record<Kind, RecipientMode | null> = { marks: 'both', fees: null };
+
 interface Fetched {
   kind: Kind; ref: string; label: string; at: number;
-  data: Map<number, StudentVars>;            // local student id → variables
+  data: Map<number, StudentVars | Statement>;   // local student id → variables (marks: + the Frappe results in it)
 }
-interface FetchBody { kind: Kind; year?: string; exam?: string; groupIds?: number[]; dueBy?: string | null; minAmount?: number }
+interface FetchBody extends TestFilter { kind: Kind; plans?: string[]; includeSent?: boolean; groupIds?: number[]; dueBy?: string | null; minAmount?: number }
+
+export interface CampaignSpec {
+  kind: Kind; ref: string; label: string; template: string; numberIds: number[];
+  data: Map<number, StudentVars>;
+}
 
 /**
  * 1-Click notifications: fetch marks / pending fees from Frappe, review who gets what, send.
@@ -27,81 +34,61 @@ export class OneClickService {
   private fetched = new Map<string, Fetched>();
 
   constructor(
-    private readonly db: Db, private readonly frappe: FrappeSyncService, private readonly settings: SettingsService, private readonly campaigns: CampaignsService,
+    private readonly db: Db, private readonly marks: MarksService, private readonly settings: SettingsService, private readonly campaigns: CampaignsService,
   ) {}
 
-  private async frappeGet<T>(doctype: string, fields: string[], filters?: unknown[]): Promise<T[]> {
-    if (!frappeConfigured()) throw new BadRequestException('Frappe is not configured (FRAPPE_URL / FRAPPE_API_KEY / FRAPPE_API_SECRET)');
-    try { return await this.frappe.get<T>(doctype, fields, filters); } catch (e) {
-      throw new BadRequestException(e instanceof FrappeAccessError
-        ? `GCM Notified can't read "${e.doctype}" in Frappe yet. Ask the Frappe admin to give the API user's role read permission on ${e.doctype}.`
-        : (e as Error).message);
-    }
-  }
-
-  /** Exams with results in Frappe (newest year first), for the picker. */
-  async exams() {
-    const rows = await this.frappeGet<{ academic_year: string; assessment_group: string; student: string }>(
-      'Assessment Result', ['academic_year', 'assessment_group', 'student'], [['docstatus', '=', 1]]);
-    const by = new Map<string, { year: string; exam: string; students: Set<string>; results: number }>();
-    for (const r of rows) {
-      if (!r.assessment_group) continue;
-      const k = `${r.academic_year ?? ''}|${r.assessment_group}`;
-      const e = by.get(k) ?? { year: r.academic_year ?? '', exam: r.assessment_group, students: new Set(), results: 0 };
-      e.students.add(r.student); e.results++; by.set(k, e);
-    }
-    const sent = new Map((await this.db.query<{ ref: string; n: number; last: Date }>(
-      `select ref, count(distinct student_id)::int n, max(created_at) last from oneclick_log where kind='marks' group by ref`)).map((r) => [r.ref, r]));
-    return [...by.values()]
-      .map((e) => ({ year: e.year, exam: e.exam, students: e.students.size, results: e.results, sent: sent.get(`${e.year}|${e.exam}`) ?? null }))
-      .sort((a, b) => b.year.localeCompare(a.year) || a.exam.localeCompare(b.exam));
+  /** Who a kind goes to: marks always both parents, fees per the Fees message type. */
+  private async mode(kind: Kind) {
+    const s = await this.settings.get();
+    const type = await this.settings.builtInType(TYPE[kind]);
+    return { s, type, mode: MODE[kind] ?? type.school };
   }
 
   /** Fetches from Frappe and returns one row per student with what they would get. */
   async fetch(b: FetchBody) {
     const kind: Kind = b.kind === 'fees' ? 'fees' : 'marks';
-    let byFrappe: Map<string, StudentVars>, ref: string, label: string;
+    let students: StudentRow[], data: Map<number, StudentVars | Statement>, notInApp: number, ref: string, label: string;
+    let alreadySent = 0;
     if (kind === 'marks') {
-      if (!b.exam) throw new BadRequestException('Choose an exam');
-      const filters: unknown[] = [['docstatus', '=', 1], ['assessment_group', '=', b.exam]];
-      if (b.year) filters.push(['academic_year', '=', b.year]);
-      const rows = await this.frappeGet<any>('Assessment Result',
-        ['student', 'course', 'total_score', 'maximum_score', 'grade', 'assessment_group', 'academic_year'], filters);
-      byFrappe = buildMarks(rows, b.exam);
-      ref = `${b.year ?? ''}|${b.exam}`;
-      label = `${b.exam}${b.year ? ` ${b.year}` : ''} marks`;
+      const r = await this.marks.forTests(b);
+      ({ students, data, notInApp, alreadySent } = r);
+      ref = 'statement';
+      label = r.period;
     } else {
-      const rows = await this.frappeGet<any>('Fees',
+      const rows = await this.marks.frappeGet<any>('Fees',
         ['name', 'student', 'outstanding_amount', 'grand_total', 'due_date', 'academic_term', 'fee_structure', 'fee_schedule', 'posting_date'],
         [['docstatus', '=', 1], ['outstanding_amount', '>', 0]]);
-      byFrappe = buildFees(rows, { dueBy: b.dueBy || null, minAmount: Number(b.minAmount) || 0 });
+      const byFrappe = buildFees(rows, { dueBy: b.dueBy || null, minAmount: Number(b.minAmount) || 0 });
       ref = 'fees';
       label = `Fee reminder${b.dueBy ? ` (due by ${fmtDate(b.dueBy)})` : ''}`;
+      // Match to students in the app (synced from Frappe), optionally only some classes
+      const ids = (b.groupIds ?? []).map(Number).filter(Number.isFinite);
+      const found = await this.db.query<StudentRow & { frappe_id: string }>(
+        `select s.* from students s join contact_groups g on g.id = s.group_id
+         where s.active and s.frappe_id = any($1) and (cardinality($2::int[]) = 0 or g.id = any($2) or g.parent_id = any($2))
+         order by s.program, s.section, s.student_name`, [[...byFrappe.keys()], ids]);
+      students = found;
+      data = new Map(found.map((st) => [st.id, byFrappe.get(st.frappe_id)!]));
+      notInApp = ids.length ? 0 : byFrappe.size - found.length;
     }
 
-    // Match to students in the app (synced from Frappe), optionally only some classes
-    const ids = (b.groupIds ?? []).map(Number).filter(Number.isFinite);
-    const students = await this.db.query<StudentRow & { frappe_id: string }>(
-      `select s.* from students s join contact_groups g on g.id = s.group_id
-       where s.active and s.frappe_id = any($1) and (cardinality($2::int[]) = 0 or g.id = any($2) or g.parent_id = any($2))
-       order by s.program, s.section, s.student_name`, [[...byFrappe.keys()], ids]);
-    const notInApp = ids.length ? 0 : byFrappe.size - students.length;
-
-    const s = await this.settings.get();
-    const type = await this.settings.builtInType(TYPE[kind]);
+    const { s, type, mode } = await this.mode(kind);
     const opted = new Set((await this.db.query<{ phone: string }>('select phone from opt_outs')).map((r) => r.phone));
     const phones = students.flatMap((x) => [x.father_phone, x.mother_phone, x.student_phone]).filter(Boolean) as string[];
     const wa = new Map((await this.db.query<{ phone: string; on_whatsapp: boolean }>('select phone, on_whatsapp from phone_checks where phone = any($1)', [phones])).map((r) => [r.phone, r.on_whatsapp]));
-    const last = new Map((await this.db.query<{ student_id: number; created_at: Date; summary: string }>(
-      `select distinct on (student_id) student_id, created_at, summary from oneclick_log where kind=$1 and ref=$2 order by student_id, created_at desc`,
-      [kind, ref])).map((r) => [r.student_id, r]));
+    // Marks: when any of these results went out before (only possible with "include already sent")
+    const last = new Map(kind === 'marks'
+      ? (await this.db.query<{ student_id: number; created_at: Date }>(
+        `select student_id, max(created_at) created_at from marks_sent where result_name = any($1) group by student_id`,
+        [[...data.values()].flatMap((v) => (v as Statement).results.map((r) => r.name))])).map((r) => [r.student_id, { created_at: r.created_at, summary: '' }])
+      : (await this.db.query<{ student_id: number; created_at: Date; summary: string }>(
+        `select distinct on (student_id) student_id, created_at, summary from oneclick_log where kind=$1 and ref=$2 order by student_id, created_at desc`,
+        [kind, ref])).map((r) => [r.student_id, r]));
 
-    const data = new Map<number, StudentVars>();
-    const recentDays = kind === 'fees' ? 3 : 3650;
+    const recentDays = kind === 'fees' ? 3 : 0;
     const rows = students.map((st) => {
-      const v = byFrappe.get(st.frappe_id)!;
-      data.set(st.id, v);
-      const to = phonesFor(st, type.school, s.primaryParent).map((p) => ({
+      const v = data.get(st.id)!;
+      const to = phonesFor(st, mode, s.primaryParent).map((p) => ({
         relation: p.relation, phone: p.phone, optedOut: opted.has(p.phone), wa: wa.get(p.phone) ?? null,
       }));
       const reachable = to.filter((p) => !p.optedOut && p.wa !== false);
@@ -120,9 +107,9 @@ export class OneClickService {
     this.fetched.set(fetchId, { kind, ref, label, at: Date.now(), data });
     const total = kind === 'fees' ? rupees([...data.values()].reduce((a, x) => a + Number(x.vars.amount_number), 0)) : null;
     return {
-      fetchId, kind, label, fetchedAt: new Date(), rows, notInApp, total,
-      type: { key: type.key, name: type.name, icon: type.icon, school: type.school },
-      template: s.oneClick[kind].template,
+      fetchId, kind, label, fetchedAt: new Date(), rows, notInApp, total, alreadySent,
+      type: { key: type.key, name: type.name, icon: type.icon, school: mode },
+      template: kind === 'marks' ? s.marksReport.template : s.oneClick.fees.template,
     };
   }
 
@@ -141,9 +128,8 @@ export class OneClickService {
     const v = f.data.get(Number(b.studentId));
     if (!v) throw new NotFoundException('Student not in this list');
     const st = await this.db.one<StudentRow>('select * from students where id=$1', [b.studentId]);
-    const s = await this.settings.get();
-    const type = await this.settings.builtInType(TYPE[f.kind]);
-    const r = studentRecipients([{ ...st!, csv: v.vars as any }], type.school, s.primaryParent, true).recipients[0];
+    const { s, mode } = await this.mode(f.kind);
+    const r = studentRecipients([{ ...st!, csv: v.vars as any }], mode, s.primaryParent, true).recipients[0];
     try { checkTemplate(b.template); } catch (e) { throw new BadRequestException((e as Error).message); }
     // No usable number: still preview with the student's details (the parent name stays empty)
     const vars = r?.vars ?? { student_name: st!.student_name, first_name: st!.student_name.split(/\s+/)[0], admission_no: st!.admission_no,
@@ -163,33 +149,41 @@ export class OneClickService {
 
     if (b.saveTemplate) {
       const s = await this.settings.get();
-      await this.settings.update({ oneClick: { ...s.oneClick, [f.kind]: { template } } });
+      await this.settings.update(f.kind === 'marks' ? { marksReport: { ...s.marksReport, template } } : { oneClick: { ...s.oneClick, fees: { template } } });
     }
-    const type = await this.settings.builtInType(TYPE[f.kind]);
+    const data = new Map(ids.map((id) => [id, f.data.get(id)!]));
+    const r = await this.createCampaign({ kind: f.kind, ref: f.ref, label: f.label, template, numberIds: b.numberIds, data });
+    if (f.kind === 'marks') await this.marks.recordSent(data as Map<number, Statement>, r.campaignId, null);
+    await this.db.event('campaign', `1-Click: ${f.label} sent for ${data.size} students`);
+    return r;
+  }
+
+  /** Creates the campaign (type Academic / Fees), one row per student with their variables, and launches it. */
+  async createCampaign(spec: CampaignSpec) {
+    const { type, mode } = await this.mode(spec.kind);
     const known = await this.settings.messageType(type.key);
-    const name = `${type.icon} ${f.label} · ${fmtDate(localDay(new Date()))}`;
+    const name = `${type.icon} ${spec.label} · ${fmtDate(localDay(new Date()))}`;
     const c = await this.campaigns.create({ name, kind: 'contacts' });
     await this.campaigns.update(c!.id, {
-      ...(known ? { message_type: type.key } : { recipient_mode: type.school, respect_quiet_hours: type.quietHours }),
-      body: template, number_ids: b.numberIds, per_child: true,
+      ...(known ? { message_type: type.key } : { respect_quiet_hours: type.quietHours }),
+      recipient_mode: mode, body: spec.template, number_ids: spec.numberIds, per_child: true,
     });
-    const students = await this.db.query<{ id: number; admission_no: string }>('select id, admission_no from students where id = any($1)', [ids]);
-    const columns = [...new Set(students.flatMap((x) => Object.keys(f.data.get(x.id)!.vars)))];
+    const students = await this.db.query<{ id: number; admission_no: string }>('select id, admission_no from students where id = any($1)', [[...spec.data.keys()]]);
+    const columns = [...new Set(students.flatMap((x) => Object.keys(spec.data.get(x.id)!.vars)))];
     await this.db.tx(async (tx) => {
       let i = 0;
       for (const st of students) {
         await tx.query('insert into campaign_rows(campaign_id, row_no, key_value, data, student_id, matched) values ($1,$2,$3,$4,$5,true)',
-          [c!.id, ++i, st.admission_no, JSON.stringify(f.data.get(st.id)!.vars), st.id]);
+          [c!.id, ++i, st.admission_no, JSON.stringify(spec.data.get(st.id)!.vars), st.id]);
       }
-      const csv = { filename: `Frappe · ${f.label}`, keyColumn: 'admission_no', keyType: 'admission', nameColumn: null, columns, variables: columns, rows: students.length, matched: students.length, unmatched: 0 };
-      await tx.query(`update campaigns set audience = $2 where id=$1`, [c!.id, JSON.stringify({ csv, oneClick: { kind: f.kind, ref: f.ref, label: f.label } })]);
+      const csv = { filename: `Frappe · ${spec.label}`, keyColumn: 'admission_no', keyType: 'admission', nameColumn: null, columns, variables: columns, rows: students.length, matched: students.length, unmatched: 0 };
+      await tx.query(`update campaigns set audience = $2 where id=$1`, [c!.id, JSON.stringify({ csv, oneClick: { kind: spec.kind, ref: spec.ref, label: spec.label } })]);
     });
     const launched = await this.campaigns.launch(c!.id, false);
     for (const st of students) {
       await this.db.query('insert into oneclick_log(kind, ref, student_id, campaign_id, summary) values ($1,$2,$3,$4,$5)',
-        [f.kind, f.ref, st.id, c!.id, f.data.get(st.id)!.summary]);
+        [spec.kind, spec.ref, st.id, c!.id, spec.data.get(st.id)!.summary]);
     }
-    await this.db.event('campaign', `1-Click: ${f.label} sent for ${students.length} students`);
     return { campaignId: c!.id, total: launched.total };
   }
 
@@ -202,8 +196,8 @@ export class OneClickService {
 
 @Controller('oneclick')
 export class OneClickController {
-  constructor(private readonly oc: OneClickService) {}
-  @Get('exams') exams() { return this.oc.exams(); }
+  constructor(private readonly oc: OneClickService, private readonly marks: MarksService) {}
+  @Post('marks/tests') tests(@Body() b: TestFilter) { return this.marks.tests(b); }
   @Post('fetch') fetch(@Body() b: FetchBody) { return this.oc.fetch(b); }
   @Post('render') render(@Body() b: any) { return this.oc.render(b); }
   @Post('send') send(@Body() b: any) { return this.oc.send(b); }
