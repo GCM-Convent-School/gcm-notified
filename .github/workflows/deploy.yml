@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/gcm-notified
+  IMAGE: ghcr.io/gcm-convent-school/gcm-notified   # registry names must be lowercase
 
 jobs:
   test:

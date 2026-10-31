@@ -1,5 +1,5 @@
 # GCM Notified — single image: NestJS API + React dashboard
-# Built by GitHub Actions → ghcr.io/modidiviyansh/gcm-notified, hosted on Coolify.
+# Built by GitHub Actions → ghcr.io/gcm-convent-school/gcm-notified, hosted on Coolify.
 
 # ---------- 1. dashboard (React + Vite) ----------
 FROM node:22-alpine AS web
