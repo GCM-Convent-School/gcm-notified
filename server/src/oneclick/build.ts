@@ -1,9 +1,19 @@
-// Turns Frappe rows into per-student message variables for 1-Click notifications.
+// Turns Frappe rows into per-student message variables for special notifications.
+
+import type { RepeatSchedule } from '../campaigns/schedule';
 
 export interface FeeRow {
   name: string; student: string; outstanding_amount?: number | null; grand_total?: number | null; due_date?: string | null;
   academic_term?: string | null; fee_structure?: string | null; fee_schedule?: string | null; posting_date?: string | null;
 }
+/** Fee reminder timing (settings.feesReport) as a repeat schedule, so the campaign scheduler's date maths is reused. */
+export function feesSchedule(f: { repeat: 'weekly' | 'every'; days: number[]; every: number; startDate: string; time: string; skipHolidays: boolean }, today: string): RepeatSchedule {
+  return {
+    mode: 'repeat', freq: f.repeat === 'every' ? 'every' : 'days', days: f.days, every: f.every,
+    startDate: f.startDate || today, time: { type: 'exact', at: f.time }, end: { type: 'never' }, skipHolidays: f.skipHolidays,
+  };
+}
+
 export interface StudentVars { summary: string; vars: Record<string, unknown> }
 
 const inr = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 });

@@ -7,6 +7,7 @@ import { SCHOOL_LABEL } from '../components/rules';
 import { ListPicker } from './CampaignEditor';
 import type { GroupNode } from './Contacts';
 import { DailyMarksReport, MarksPick, MarksPicker } from './MarksReport';
+import { FeesReminders } from './FeesReport';
 
 type Kind = 'marks' | 'fees';
 interface Row {
@@ -26,7 +27,7 @@ const KINDS: Record<Kind, { icon: string; title: string; text: string; vars: [st
     vars: [['marks', 'Test list'], ['total', 'Total'], ['max', 'Out of'], ['percent', '%'], ['rank_line', 'Rank / note'], ['period', 'Period'], ['student_name', 'Student'], ['class', 'Class'], ['section', 'Section'], ['parent_name', 'Parent']],
   },
   fees: {
-    icon: '💰', title: 'Pending fees', text: "Each parent gets what's still outstanding for their child, straight from Frappe.",
+    icon: '💰', title: 'Pending fees', text: "The father gets what's still outstanding for his child, straight from Frappe — weekly or every few days.",
     vars: [['amount', 'Amount due'], ['fee_list', 'Fee list'], ['due_date', 'Earliest due date'], ['fee_count', 'No. of fees'], ['student_name', 'Student'], ['class', 'Class'], ['section', 'Section'], ['parent_name', 'Parent']],
   },
 };
@@ -34,49 +35,91 @@ const STATUS: Record<Row['status'], [string, string]> = {
   ready: ['Ready', 'green'], no_number: ['No number', 'red'], not_on_whatsapp: ['Not on WhatsApp', 'red'], opted_out: ['Replied STOP', 'amber'],
 };
 
+type Tab = 'auto' | 'manual';
+interface HistoryRow {
+  row: 'campaign' | 'run'; id: number; campaign_id: number | null; name: string; status: string; kind: Kind; auto: boolean;
+  total: number; sent: number; read: number; failed: number; created_at: string;
+}
+const AUTO: Record<Kind, { title: string; status: string }> = {
+  marks: { title: 'Daily Marks Report', status: '/oneclick/marks-report' },
+  fees: { title: 'Fee reminders', status: '/oneclick/fees-report' },
+};
+
 export default function OneClick() {
   const [params, setParams] = useSearchParams();
   const kind = (params.get('kind') as Kind | null) ?? null;
+  const tab: Tab = params.get('tab') === 'manual' ? 'manual' : 'auto';
   return (
     <>
-      <PageHeader title="1-Click Notify" subtitle="Personalised messages to parents, filled in from the school system"
-        actions={kind && <button className="btn-secondary" onClick={() => setParams({})}>← All notifications</button>} />
-      {kind && KINDS[kind] ? <Flow key={kind} kind={kind} /> : <Home onPick={(k) => setParams({ kind: k })} />}
+      <PageHeader title={kind && KINDS[kind] ? `${KINDS[kind].icon} ${KINDS[kind].title}` : 'Special notifications'}
+        subtitle="Personalised messages to parents, filled in from the school system — automatically on a schedule, or by hand"
+        actions={kind && <button className="btn-secondary" onClick={() => setParams({})}>← Special notifications</button>} />
+      {kind && KINDS[kind] ? (
+        <div className="space-y-5">
+          <div className="flex w-fit gap-1 rounded-xl bg-slate-100 p-1 text-sm">
+            {([['auto', '⏱ Automatic (scheduled)'], ['manual', '✋ Manual']] as const).map(([k, l]) => (
+              <button key={k} onClick={() => setParams({ kind, tab: k })} className={`rounded-lg px-4 py-1.5 ${tab === k ? 'bg-white font-semibold text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}>{l}</button>))}
+          </div>
+          {tab === 'auto' ? (kind === 'marks' ? <DailyMarksReport /> : <FeesReminders />) : <Flow key={kind} kind={kind} />}
+          <History kind={kind} />
+        </div>
+      ) : <Home onPick={(k) => setParams({ kind: k })} />}
     </>
   );
 }
 
 function Home({ onPick }: { onPick: (k: Kind) => void }) {
-  const { data: history } = useLoad(() => api.get<any[]>('/oneclick/history'), []);
   return (
     <div className="space-y-6">
-      <DailyMarksReport />
       <div className="grid gap-4 md:grid-cols-2">
-        {(Object.keys(KINDS) as Kind[]).map((k) => (
-          <button key={k} onClick={() => onPick(k)} className="card group p-5 text-left transition hover:border-brand-600 hover:shadow-md">
-            <div className="text-3xl">{KINDS[k].icon}</div>
-            <div className="mt-2 text-base font-semibold text-slate-900">{KINDS[k].title}</div>
-            <p className="mt-1 text-sm text-slate-600">{KINDS[k].text}</p>
-            <span className="mt-3 inline-block text-sm font-medium text-brand-700 group-hover:underline">Start →</span>
-          </button>
-        ))}
+        {(Object.keys(KINDS) as Kind[]).map((k) => <KindCard key={k} kind={k} onPick={() => onPick(k)} />)}
       </div>
-      <Card title="Recently sent">
-        {history?.length ? (
-          <table className="table">
-            <thead><tr><th>Notification</th><th>Status</th><th className="text-right">Sent</th><th className="text-right">Read</th><th>When</th></tr></thead>
-            <tbody>{history.map((h) => (
-              <tr key={h.id}>
-                <td><Link to={`/campaigns/${h.id}`} className="font-medium text-brand-700 hover:underline">{h.name}</Link></td>
-                <td><Badge tone={statusTone(h.status)}>{h.status}</Badge></td>
-                <td className="text-right tabular-nums">{h.sent}/{h.total}</td>
-                <td className="text-right tabular-nums">{h.read}</td>
-                <td className="text-xs text-slate-500">{fmtDate(h.created_at)}</td>
-              </tr>))}</tbody>
-          </table>
-        ) : <p className="text-sm text-slate-500">Nothing sent yet. Pick a notification above.</p>}
-      </Card>
+      <History />
     </div>
+  );
+}
+
+function KindCard({ kind, onPick }: { kind: Kind; onPick: () => void }) {
+  const { data } = useLoad(() => api.get<{ settings: { enabled: boolean }; running: boolean; nextRuns: string[] }>(AUTO[kind].status), [kind], 60_000);
+  const on = data?.settings.enabled;
+  return (
+    <button onClick={onPick} className="card group p-5 text-left transition hover:border-brand-600 hover:shadow-md">
+      <div className="flex items-start justify-between gap-3">
+        <div className="text-3xl">{KINDS[kind].icon}</div>
+        {data && <Badge tone={on ? 'green' : 'slate'}>{data.running ? 'Running…' : on ? 'Automatic: on' : 'Automatic: off'}</Badge>}
+      </div>
+      <div className="mt-2 text-base font-semibold text-slate-900">{KINDS[kind].title}</div>
+      <p className="mt-1 text-sm text-slate-600">{KINDS[kind].text}</p>
+      <p className="mt-2 text-xs text-slate-500">
+        {AUTO[kind].title}: {!data ? '…' : on ? (data.nextRuns[0] ? `next ${fmtDate(data.nextRuns[0])}` : 'no run coming up') : 'off'}
+      </p>
+      <span className="mt-3 inline-block text-sm font-medium text-brand-700 group-hover:underline">Open — automatic & manual →</span>
+    </button>
+  );
+}
+
+/** Every run, scheduled or manual, newest first. Scheduled runs that had nothing to send show up too. */
+function History({ kind }: { kind?: Kind }) {
+  const { data } = useLoad(() => api.get<HistoryRow[]>('/oneclick/history'), [], 30_000);
+  const rows = (data ?? []).filter((h) => !kind || h.kind === kind);
+  return (
+    <Card title={kind ? 'History' : 'History — all runs'}>
+      {rows.length ? (
+        <table className="table">
+          <thead><tr><th>When</th>{!kind && <th>Kind</th>}<th>Run</th><th>How</th><th>Status</th><th className="text-right">Sent</th><th className="text-right">Read</th></tr></thead>
+          <tbody>{rows.map((h) => (
+            <tr key={`${h.row}-${h.id}`}>
+              <td className="whitespace-nowrap text-xs text-slate-500">{fmtDate(h.created_at)}</td>
+              {!kind && <td className="whitespace-nowrap text-sm">{KINDS[h.kind]?.icon} {h.kind === 'marks' ? 'Marks' : 'Fees'}</td>}
+              <td>{h.campaign_id ? <Link to={`/campaigns/${h.campaign_id}`} className="font-medium text-brand-700 hover:underline">{h.name}</Link> : <span className="text-slate-700">{h.name}</span>}</td>
+              <td><Badge tone={h.auto ? 'violet' : 'blue'}>{h.auto ? 'Automatic' : 'Manual'}</Badge></td>
+              <td><Badge tone={h.status === 'nothing to send' ? 'slate' : statusTone(h.status)}>{h.status}</Badge></td>
+              <td className="text-right tabular-nums">{h.campaign_id ? `${h.sent}/${h.total}` : '—'}</td>
+              <td className="text-right tabular-nums">{h.campaign_id ? h.read : '—'}</td>
+            </tr>))}</tbody>
+        </table>
+      ) : <p className="text-sm text-slate-500">Nothing has run yet.</p>}
+    </Card>
   );
 }
 
@@ -249,7 +292,7 @@ function Flow({ kind }: { kind: Kind }) {
                 <p className="mt-2 text-xs text-slate-500">
                   Goes to: <b>{SCHOOL_LABEL[data.type.school]}</b>{kind === 'marks'
                     ? ' (always, for marks — the same number twice gets one message).'
-                    : <> (from the {data.type.icon} {data.type.name} message type — <Link to="/settings?tab=types" className="underline">change</Link>).</>}
+                    : " (always, for fees — students without a father's number can't be reached)."}
                   {counts.sent > 0 && ' Students already notified are not ticked — tick them to send again.'}
                 </p>
               </>

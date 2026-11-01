@@ -15,7 +15,7 @@ import { PrivacyProvider } from './components/phone';
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: '◧' },
-  { to: '/notify', label: '1-Click Notify', icon: '⚡' },
+  { to: '/notify', label: 'Special notifications', icon: '⚡' },
   { to: '/campaigns', label: 'Campaigns', icon: '✉' },
   { to: '/contacts', label: 'Contacts', icon: '☰' },
   { to: '/numbers', label: 'Numbers', icon: '☏' },

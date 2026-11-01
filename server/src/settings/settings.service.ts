@@ -34,7 +34,8 @@ export interface AppSettings {
   waCheck: { enabled: boolean; everyDays: number; perHour: number };   // background "is this number on WhatsApp?" check
   api: { perMinute: number };          // public send API: messages per key per minute
   oneClick: { marks: { template: string }; fees: { template: string } };
-  marksReport: MarksReportSettings;    // Daily Marks Report + the marks statement used by manual 1-Click marks
+  marksReport: MarksReportSettings;    // Daily Marks Report + the marks statement used by manual marks
+  feesReport: FeesReportSettings;      // scheduled fee reminders (message: oneClick.fees.template, shared with manual fees)
   seededTypes: string[];               // default message types already added once (a removed one is not re-added)
 }
 
@@ -48,6 +49,19 @@ export interface MarksReportSettings {
   rules: RankRules;
   lines: Lines;
   template: string;
+}
+
+/** Fee reminders on a schedule: chosen weekdays, or every N days from a start date. Fathers only. */
+export interface FeesReportSettings {
+  enabled: boolean;
+  time: string;                        // HH:MM, app timezone
+  repeat: 'weekly' | 'every';
+  days: number[];                      // weekly: 0 = Sunday
+  every: number;                       // every N days, counted from startDate
+  startDate: string;                   // YYYY-MM-DD (set when first switched on)
+  skipHolidays: boolean;
+  dueWithinDays: number | null;        // only fees due within this many days from the run (0 = overdue/due today); null = all outstanding
+  minAmount: number;                   // skip students owing less than this (₹)
 }
 
 export const STATEMENT_TEMPLATE = `Dear Parent,
@@ -101,6 +115,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   waCheck: { enabled: true, everyDays: 7, perHour: 200 },
   api: { perMinute: 60 },
   oneClick: { marks: { template: MARKS_TEMPLATE }, fees: { template: FEES_TEMPLATE } },
+  feesReport: { enabled: false, time: '10:00', repeat: 'weekly', days: [1], every: 7, startDate: '', skipHolidays: true, dueWithinDays: null, minAmount: 0 },
   marksReport: { enabled: false, time: '19:00', days: [1, 2, 3, 4, 5, 6], skipHolidays: true, startFrom: '', rules: DEFAULT_RULES, lines: DEFAULT_LINES, template: STATEMENT_TEMPLATE },
   seededTypes: ['notice', 'invitation', 'fees', 'greeting', 'reminder', 'sos', 'academic'],
   messageTypes: [
@@ -184,6 +199,7 @@ export class SettingsService {
       next.oneClick[k] = { template: t || (k === 'marks' ? MARKS_TEMPLATE : FEES_TEMPLATE) };
     }
     next.marksReport = cleanMarksReport(next.marksReport);
+    next.feesReport = cleanFeesReport(next.feesReport);
     next.holidays = [...new Set((next.holidays ?? []).map((d) => String(d).trim()).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)))].sort();
     await this.db.query(
       `insert into settings(key, value, updated_at) values ('app', $1, now())
@@ -215,6 +231,21 @@ export function cleanMarksReport(m: any): MarksReportSettings {
       topPct: clamp(m?.rules?.topPct, 1, 100, DEFAULT_RULES.topPct),
     },
     lines, template,
+  };
+}
+
+export function cleanFeesReport(f: any): FeesReportSettings {
+  const time = /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(f?.time)) ? String(f.time).padStart(5, '0') : '10:00';
+  const repeat = f?.repeat === 'every' ? 'every' : 'weekly';
+  const days = [...new Set((Array.isArray(f?.days) ? f.days : []).map(Number).filter((d: number) => d >= 0 && d <= 6))].sort() as number[];
+  if (f?.enabled && repeat === 'weekly' && !days.length) throw new BadRequestException('Fee reminders: pick at least one day');
+  const due = f?.dueWithinDays;
+  return {
+    enabled: !!f?.enabled, time, repeat, days, every: clamp(f?.every, 1, 90, 7),
+    startDate: /^\d{4}-\d{2}-\d{2}$/.test(String(f?.startDate)) ? String(f.startDate) : '',
+    skipHolidays: f?.skipHolidays !== false,
+    dueWithinDays: due === null || due === '' || due === undefined ? null : Math.max(0, Math.min(365, Math.round(Number(due) || 0))),
+    minAmount: Math.max(0, Math.round(Number(f?.minAmount) || 0)),
   };
 }
 

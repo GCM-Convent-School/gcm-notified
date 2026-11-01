@@ -23,17 +23,18 @@ import { WaCheckService } from './contacts/wa-check.service';
 import { OneClickController, OneClickService } from './oneclick/oneclick.service';
 import { MarksService } from './oneclick/marks.service';
 import { MarksReportController, MarksReportService } from './oneclick/marks-report.service';
+import { FeesReportController, FeesReportService } from './oneclick/fees-report.service';
 
 @Module({
   imports: [ScheduleModule.forRoot()],
   controllers: [
     AuthController, SettingsController, NumbersController, ContactsController, MediaController,
-    CampaignsController, TemplatesController, WebhooksController, PublicApiController, ApiKeysController, OneClickController, MarksReportController,
+    CampaignsController, TemplatesController, WebhooksController, PublicApiController, ApiKeysController, OneClickController, MarksReportController, FeesReportController,
   ],
   providers: [
     { provide: APP_GUARD, useClass: AuthGuard },
     Db, WahaClient, SettingsService, AlertsService, NumbersService, FrappeSyncService, PeopleService, CampaignsService, SchedulerService, SenderService,
-    ApiService, WaCheckService, OneClickService, MarksService, MarksReportService,
+    ApiService, WaCheckService, OneClickService, MarksService, MarksReportService, FeesReportService,
   ],
 })
 export class AppModule {}

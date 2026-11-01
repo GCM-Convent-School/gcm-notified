@@ -23,7 +23,7 @@ export function frappeNow(d = new Date()): string {
 /**
  * Daily Marks Report: at the set time on the set days, every result submitted in Frappe since the last
  * successful run goes to both parents as one statement per student. Hands-off; the admin gets a summary
- * after each run and an alert when something is wrong. Switch off from the 1-Click page.
+ * after each run and an alert when something is wrong. Switch off from Special notifications → Marks.
  */
 @Injectable()
 export class MarksReportService {
@@ -141,7 +141,7 @@ export class MarksReportService {
 
     const numbers = await this.db.query<{ id: number }>(`select id from wa_numbers where status='WORKING' and not paused and auto_use order by id`);
     if (!numbers.length) throw new BadRequestException('No connected WhatsApp number is available to send from');
-    const r = await this.oneClick.createCampaign({ kind: 'marks', ref: 'daily', label: 'Daily marks report', template: s.template, numberIds: numbers.map((n) => n.id), data });
+    const r = await this.oneClick.createCampaign({ kind: 'marks', ref: 'daily', label: 'Daily marks report', template: s.template, numberIds: numbers.map((n) => n.id), data, auto: true });
     await this.marks.recordSent(data, r.campaignId, runId);
     await this.db.event('campaign', `Daily Marks Report: ${data.size} students, ${base.tests.length} tests (${r.total} messages)`);
     return { ...base, campaignId: r.campaignId, messages: r.total };

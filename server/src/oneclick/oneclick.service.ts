@@ -11,8 +11,8 @@ import { MarksService, Statement, TestFilter } from './marks.service';
 type Kind = 'marks' | 'fees';
 const TYPE: Record<Kind, 'academic' | 'fees'> = { marks: 'academic', fees: 'fees' };
 
-// Marks always go to both parents (the same number twice gets one message)
-const MODE: Record<Kind, RecipientMode | null> = { marks: 'both', fees: null };
+// Marks go to both parents (the same number twice gets one message); fee reminders only to the father
+const MODE: Record<Kind, RecipientMode> = { marks: 'both', fees: 'father' };
 
 interface Fetched {
   kind: Kind; ref: string; label: string; at: number;
@@ -20,13 +20,16 @@ interface Fetched {
 }
 interface FetchBody extends TestFilter { kind: Kind; plans?: string[]; includeSent?: boolean; groupIds?: number[]; dueBy?: string | null; minAmount?: number }
 
+export interface FeesFilter { groupIds?: number[]; dueBy?: string | null; minAmount?: number }
+
 export interface CampaignSpec {
   kind: Kind; ref: string; label: string; template: string; numberIds: number[];
   data: Map<number, StudentVars>;
+  auto?: boolean;                    // sent by a schedule (Daily Marks Report / fee reminders), not by hand
 }
 
 /**
- * 1-Click notifications: fetch marks / pending fees from Frappe, review who gets what, send.
+ * Special notifications: fetch marks / pending fees from Frappe, review who gets what, send.
  * A fetch is kept for 30 minutes so the send uses exactly the data that was reviewed.
  */
 @Injectable()
@@ -37,11 +40,27 @@ export class OneClickService {
     private readonly db: Db, private readonly marks: MarksService, private readonly settings: SettingsService, private readonly campaigns: CampaignsService,
   ) {}
 
-  /** Who a kind goes to: marks always both parents, fees per the Fees message type. */
+  /** Who a kind goes to: marks both parents, fees the father. Pacing and quiet hours come from the message type. */
   private async mode(kind: Kind) {
     const s = await this.settings.get();
     const type = await this.settings.builtInType(TYPE[kind]);
-    return { s, type, mode: MODE[kind] ?? type.school };
+    return { s, type, mode: MODE[kind] };
+  }
+
+  /** Outstanding fees from Frappe → one entry per student in the app. Shared by the manual screen and the fee reminder schedule. */
+  async feesData(b: FeesFilter) {
+    const rows = await this.marks.frappeGet<any>('Fees',
+      ['name', 'student', 'outstanding_amount', 'grand_total', 'due_date', 'academic_term', 'fee_structure', 'fee_schedule', 'posting_date'],
+      [['docstatus', '=', 1], ['outstanding_amount', '>', 0]]);
+    const byFrappe = buildFees(rows, { dueBy: b.dueBy || null, minAmount: Number(b.minAmount) || 0 });
+    // Match to students in the app (synced from Frappe), optionally only some classes
+    const ids = (b.groupIds ?? []).map(Number).filter(Number.isFinite);
+    const students = await this.db.query<StudentRow & { frappe_id: string }>(
+      `select s.* from students s join contact_groups g on g.id = s.group_id
+       where s.active and s.frappe_id = any($1) and (cardinality($2::int[]) = 0 or g.id = any($2) or g.parent_id = any($2))
+       order by s.program, s.section, s.student_name`, [[...byFrappe.keys()], ids]);
+    const data = new Map<number, StudentVars>(students.map((st) => [st.id, byFrappe.get(st.frappe_id)!]));
+    return { students, data, notInApp: ids.length ? 0 : byFrappe.size - students.length };
   }
 
   /** Fetches from Frappe and returns one row per student with what they would get. */
@@ -55,21 +74,9 @@ export class OneClickService {
       ref = 'statement';
       label = r.period;
     } else {
-      const rows = await this.marks.frappeGet<any>('Fees',
-        ['name', 'student', 'outstanding_amount', 'grand_total', 'due_date', 'academic_term', 'fee_structure', 'fee_schedule', 'posting_date'],
-        [['docstatus', '=', 1], ['outstanding_amount', '>', 0]]);
-      const byFrappe = buildFees(rows, { dueBy: b.dueBy || null, minAmount: Number(b.minAmount) || 0 });
+      ({ students, data, notInApp } = await this.feesData(b));
       ref = 'fees';
       label = `Fee reminder${b.dueBy ? ` (due by ${fmtDate(b.dueBy)})` : ''}`;
-      // Match to students in the app (synced from Frappe), optionally only some classes
-      const ids = (b.groupIds ?? []).map(Number).filter(Number.isFinite);
-      const found = await this.db.query<StudentRow & { frappe_id: string }>(
-        `select s.* from students s join contact_groups g on g.id = s.group_id
-         where s.active and s.frappe_id = any($1) and (cardinality($2::int[]) = 0 or g.id = any($2) or g.parent_id = any($2))
-         order by s.program, s.section, s.student_name`, [[...byFrappe.keys()], ids]);
-      students = found;
-      data = new Map(found.map((st) => [st.id, byFrappe.get(st.frappe_id)!]));
-      notInApp = ids.length ? 0 : byFrappe.size - found.length;
     }
 
     const { s, type, mode } = await this.mode(kind);
@@ -154,7 +161,7 @@ export class OneClickService {
     const data = new Map(ids.map((id) => [id, f.data.get(id)!]));
     const r = await this.createCampaign({ kind: f.kind, ref: f.ref, label: f.label, template, numberIds: b.numberIds, data });
     if (f.kind === 'marks') await this.marks.recordSent(data as Map<number, Statement>, r.campaignId, null);
-    await this.db.event('campaign', `1-Click: ${f.label} sent for ${data.size} students`);
+    await this.db.event('campaign', `Special notification: ${f.label} sent for ${data.size} students`);
     return r;
   }
 
@@ -177,7 +184,7 @@ export class OneClickService {
           [c!.id, ++i, st.admission_no, JSON.stringify(spec.data.get(st.id)!.vars), st.id]);
       }
       const csv = { filename: `Frappe · ${spec.label}`, keyColumn: 'admission_no', keyType: 'admission', nameColumn: null, columns, variables: columns, rows: students.length, matched: students.length, unmatched: 0 };
-      await tx.query(`update campaigns set audience = $2 where id=$1`, [c!.id, JSON.stringify({ csv, oneClick: { kind: spec.kind, ref: spec.ref, label: spec.label } })]);
+      await tx.query(`update campaigns set audience = $2 where id=$1`, [c!.id, JSON.stringify({ csv, oneClick: { kind: spec.kind, ref: spec.ref, label: spec.label, auto: !!spec.auto } })]);
     });
     const launched = await this.campaigns.launch(c!.id, false);
     for (const st of students) {
@@ -187,10 +194,22 @@ export class OneClickService {
     return { campaignId: c!.id, total: launched.total };
   }
 
+  /** Every marks / fees send (scheduled or by hand), plus scheduled runs that sent nothing or failed. Newest first. */
   history() {
     return this.db.query(
-      `select id, name, status, total, sent, delivered, read, failed, skipped, created_at, audience->'oneClick'->>'kind' as kind
-       from campaigns where audience ? 'oneClick' order by id desc limit 20`);
+      `select * from (
+         select 'campaign' as row, id, id as campaign_id, name, status, total, sent, delivered, read, failed, skipped, created_at,
+                audience->'oneClick'->>'kind' as kind, coalesce((audience->'oneClick'->>'auto')::boolean, false) as auto, null::jsonb as summary
+         from campaigns where audience ? 'oneClick'
+         union all
+         select 'run', id, null, 'Daily Marks Report', case when ok then 'nothing to send' when ok is null then 'running' else 'failed' end,
+                0, 0, 0, 0, 0, 0, started_at, 'marks', true, summary
+         from marks_runs where campaign_id is null
+         union all
+         select 'run', id, null, 'Fee reminders', case when ok then 'nothing to send' when ok is null then 'running' else 'failed' end,
+                0, 0, 0, 0, 0, 0, started_at, 'fees', true, summary
+         from fees_runs where campaign_id is null
+       ) h order by created_at desc limit 30`);
   }
 }
 
